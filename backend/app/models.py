@@ -146,10 +146,14 @@ class DimensionDef:
     last_refresh: str = ""
 
     def build_hierarchy_query(self, level: int) -> str:
-        """按层级构建 GROUP BY 子句。"""
-        if level < 0 or level >= len(self.hierarchy_levels):
-            level = len(self.hierarchy_levels) - 1
-        dims = self.hierarchy_levels[:level + 1]
+        """按层级构建 GROUP BY 子句。
+
+        直接入口行为不变：越界层级（含空层级）沿用原索引 clamp 语义，
+        取列逻辑委托给可复现层级投影模块的统一函数。
+        """
+        from app.hierarchy_projection import hierarchy_fields_up_to
+
+        dims = hierarchy_fields_up_to(self, level)
         return f"GROUP BY {', '.join(dims)}"
 
 
@@ -173,6 +177,44 @@ class OlapQuery:
         """生成确定性 SQL 查询语句。"""
         if not self.metrics:
             return "SELECT 0"
+        metric_exprs = self._build_metric_exprs()
+
+        # 维度取列与空层回退统一走可复现层级投影，SQL 拼接顺序保持原样
+        from app.hierarchy_projection import project_dimensions
+
+        projection = project_dimensions(self.dimensions)
+        return self._assemble_sql(metric_exprs, list(projection.group_fields))
+
+    def _assemble_sql(self, metric_exprs: list[str], dim_keys: list[str]) -> str:
+        """按给定指标表达式与分组字段组装确定性 SQL（投影入口共用）。"""
+        table = self.metrics[0].table_name if self.metrics else "unknown"
+        parts = [f"SELECT {', '.join(dim_keys + metric_exprs)}"]
+        parts.append(f"FROM {table}")
+
+        if self.filters:
+            where_clauses = [f"{k} = '{v}'" for k, v in self.filters.items()]
+            parts.append(f"WHERE {' AND '.join(where_clauses)}")
+
+        if dim_keys:
+            parts.append(f"GROUP BY {', '.join(dim_keys)}")
+
+        if self.order_by:
+            parts.append(f"ORDER BY {self.order_by}")
+
+        return " ".join(parts)
+
+    def build_sql_with_projection(self, group_fields: list[str], metric_exprs: list[str] | None = None) -> str:
+        """按外部可复现投影的分组字段生成 SQL（用于历史计划复原）。"""
+        if not self.metrics:
+            return "SELECT 0"
+        if metric_exprs is None:
+            # 复用 build_sql 的指标表达式拼装：先按全量维度生成再截取不可行，
+            # 因此这里直接与 build_sql 同源地构造表达式。
+            metric_exprs = self._build_metric_exprs()
+        return self._assemble_sql(metric_exprs, list(group_fields))
+
+    def _build_metric_exprs(self) -> list[str]:
+        """生成与 :meth:`build_sql` 完全一致的指标表达式列表。"""
         metric_exprs = []
         for m in self.metrics:
             alias = f"_{m.metric_id}"
@@ -194,27 +236,17 @@ class OlapQuery:
                 metric_exprs.append(f"PERCENTILE({m.field_name}, 0.9) AS {alias}")
             elif m.aggregation == AggregationMethod.P99:
                 metric_exprs.append(f"PERCENTILE({m.field_name}, 0.99) AS {alias}")
+        return metric_exprs
 
-        dim_keys = []
-        for d in self.dimensions:
-            dims = d.hierarchy_levels if d.hierarchy_levels else [d.field_source]
-            dim_keys.extend(dims)
+    def build_projection(self):
+        """生成当前查询维度的可复现层级投影。
 
-        table = self.metrics[0].table_name if self.metrics else "unknown"
-        parts = [f"SELECT {', '.join(dim_keys + metric_exprs)}"]
-        parts.append(f"FROM {table}")
+        多维查询读取投影获取 SELECT 与 GROUP BY 的实际查询字段；
+        :meth:`build_sql` 内部也复用同一份取列逻辑。
+        """
+        from app.hierarchy_projection import project_dimensions
 
-        if self.filters:
-            where_clauses = [f"{k} = '{v}'" for k, v in self.filters.items()]
-            parts.append(f"WHERE {' AND '.join(where_clauses)}")
-
-        if dim_keys:
-            parts.append(f"GROUP BY {', '.join(dim_keys)}")
-
-        if self.order_by:
-            parts.append(f"ORDER BY {self.order_by}")
-
-        return " ".join(parts)
+        return project_dimensions(self.dimensions)
 
 
 # ============================================================
@@ -283,9 +315,26 @@ class DrillPath:
     precompute_mode: str = "on_demand"
 
     def map_query_dimensions(self, query: OlapQuery) -> OlapQuery:
-        """把下钻路径映射到查询维度。"""
+        """把下钻路径映射到查询维度（直接入口行为保持不变）。"""
         query.dimensions = [self.parent_dimension, self.child_dimension]
         return query
+
+    def build_projection(self):
+        """抽取下钻路径的可复现层级投影（供下钻 SQL 生成入口共用）。"""
+        from app.hierarchy_projection import project_from_drill
+
+        return project_from_drill(self)
+
+    def build_drill_query(self, query: OlapQuery) -> dict[str, Any]:
+        """下钻 SQL 生成统一入口。
+
+        先走 :meth:`map_query_dimensions` 维持直接入口的维度映射，再由
+        可复现层级投影决定 SELECT / GROUP BY 的实际查询字段，返回 SQL
+        与历史可复核的投影证据。
+        """
+        from app.hierarchy_projection import build_drill_sql
+
+        return build_drill_sql(self, query)
 
 
 # ============================================================
